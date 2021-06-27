@@ -28,6 +28,7 @@ Alternatively, if you are using the NRPE method, you should have a section simil
        check_command                   check_nrpe!check_dns_unix -t 30
        normal_check_interval           240     ; only check every 4 hours
        notification_options            c,r     ; Send notifications about critical and recovery events
+       }
 ```
 
 If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host in the /usr/local/nagios/nrpe/nrpe.cfg file:
