@@ -15,7 +15,7 @@
 #  2019/03/11   njeffrey    Switch from nslookup to dig, as nslookup is deprecated.
 #  2019/03/11   njeffrey    Confirm the IP address specified in the PTR record is bound to a local network interface
 #  2019/03/11   njeffrey    Check IP addresses bound to network interfaces with ifconfig -a or ip addr show
-#  2019/10/04   njeffrey    Only check for systemd-resolved if the uname command reports a Linux OS (no need to check on AIX, FreeBSD, etc)
+#  2022/05/17   njeffrey    Additional error-checks for Linux hosts using systemd-resolved for name resolution
 
 
 
@@ -33,7 +33,7 @@
 #  file on the nagios server that looks similar to the following.
 #  This assumes that you already have ssh key pairs configured.
 #      define service {
-#              use                             generic-8x5-service
+#              use                             generic-service
 #              hostgroup_name                  all_aix,all_linux
 #              service_description             DNS
 #              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_dns_unix
@@ -43,7 +43,7 @@
 #  Alternatively, if you are using the NRPE method, you should have a section similar to the following in
 #  the services.cfg file:
 #      define service{
-#               use                             generic-8x5-service
+#               use                             generic-service
 #               hostgroup_name                  all_aix,all_linux
 #               service_description             DNS
 #               check_command                   check_nrpe!check_dns_unix -t 30
@@ -174,8 +174,12 @@ if [ "$os" = "SunOS" ] ; then
 fi
 
 
-
+#
 # Confirm /etc/resolv.conf exists
+#
+# HINT: on Linux hosts using systemd-resolved for name resolution, the /etc/resolv.conf file will be a symlink.  For example:
+# # ls -l /etc/resolv.conf
+#    lrwxrwxrwx 1 root root 39 Apr  9  2018 /etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf
 #
 echo $verbose | $grep -q yes && echo confirm /etc/resolv.conf file exists
 #
@@ -184,16 +188,17 @@ if [ ! -e /etc/resolv.conf ]; then
    exit $WARN
 fi
 if [ ! -r /etc/resolv.conf ]; then
-   echo "$CHECK_NAME WARN - the /etc/resolv.conf file exists, but is not readable by the nagios user.  Please run chmod +r /etc/resolv.conf"
+   echo "$CHECK_NAME WARN - the /etc/resolv.conf file exists, but is not readable by the current user.  Please run chmod +r /etc/resolv.conf"
    exit $WARN
 fi
 
 
+#
 # Figure out if systemd-resolved is being used for name resolution
+# bind is the default on AIX and older versions of Linux.  Ubuntu 18+ use systemd-resolved instead of bind.
+#
 resolver=bind
-if [ "$os" = "Linux" ] ; then
-   $ps -ef | $grep -v $grep | $grep -q -i systemd-resolved && resolver=systemd-resolved
-fi
+$ps -ef | $grep -v $grep | $grep -q -i systemd-resolved && resolver=systemd-resolved
 
 
 
@@ -243,35 +248,62 @@ fi
 
 
 
-
-
-# Confirm /etc/resolv.conf contains the "domain" or "search" parameters
 #
-domain_name=unknown
-$grep -q ^domain /etc/resolv.conf && domain_name=`$grep ^domain /etc/resolv.conf | awk '{print $2}'`
-search=unknown
-$grep -q ^search /etc/resolv.conf && search=`$grep ^search /etc/resolv.conf | awk '{print $2}'`
-if [ "$domain_name" = "unknown" ] && [ "$search" = "unknown" ]; then
-   echo "$CHECK_NAME WARN - Missing domain and search parameters from /etc/resolv.conf.  Please add an entry similar to one or both of the following:  domain example.com  search example.com"
-   exit $WARN
+# if resolver=systemd-resolved, confirm a DNS domain name is defined
+# Sample command ouput:
+# # systemd-resolve --status | tail -n 3
+#   DNS Servers: 8.8.8.8
+#                8.8.4.4
+#    DNS Domain: example.com
+#
+if [ "$resolver" = "systemd-resolved" ]; then
+   domain_name=unknown
+   systemd-resolve --status | $grep -q "DNS Domain:" && domain_name=`systemd-resolve --status | $grep "DNS Domain:" | $awk '{print $3}'`
+   search=unknown
+   $grep -q ^search /etc/resolv.conf && search=`$grep ^search /etc/resolv.conf | awk '{print $2}'`
+   if [ "$domain_name" = "unknown" ] && [ "$search" = "unknown" ]; then
+      #for Ubuntu using netplan
+      test -d /etc/netplan             && echo "$CHECK_NAME WARN - Missing DNS Domain name from systemd-resolve --status output.  Please define your default domain name in /etc/netplan/*.yml"  && exit $WARN
+      #for RHEL using NetworkManager
+      test -f /usr/sbin/NetworkManager && echo "$CHECK_NAME WARN - Missing DNS Domain name.  Please define your default domain name with nmcli or in /etc/sysconfig/network-scripts/*"           && exit $WARN  
+      # should not get this far
+      echo "$CHECK_NAME WARN - Missing DNS Domain name.  Please define your default domain name." && exit $WARN  
+   fi
 fi
-# 
-# if the domain parameter is missing but the search parameter exists, set the default domain name to the same as the search parameter
-if [ "$domain_name" = "unknown" ] && [ "$search" != "unknown" ]; then
-   domain_name=$search
-fi
-echo $verbose | $grep -q yes && echo Domain name is $domain_name
 
 
 
 
+#
+# if resolver=bind, confirm /etc/resolv.conf contains the "domain" or "search" parameters
+#
+if [ "$resolver" = "bind" ]; then
+   domain_name=unknown
+   $grep -q ^domain /etc/resolv.conf && domain_name=`$grep ^domain /etc/resolv.conf | awk '{print $2}'`
+   search=unknown
+   $grep -q ^search /etc/resolv.conf && search=`$grep ^search /etc/resolv.conf | awk '{print $2}'`
+   if [ "$domain_name" = "unknown" ] && [ "$search" = "unknown" ]; then
+      echo "$CHECK_NAME WARN - Missing domain and search parameters from /etc/resolv.conf.  Please add an entry similar to one or both of the following:  domain example.com  search example.com"
+      exit $WARN
+   fi
+   # 
+   # if the domain parameter is missing but the search parameter exists, set the default domain name to the same as the search parameter
+   # 
+   if [ "$domain_name" = "unknown" ] && [ "$search" != "unknown" ]; then
+      domain_name=$search
+   fi
+   echo $verbose | $grep -q yes && echo Domain name is $domain_name
+fi 
+
+
+
+#
 # ping name servers
 #
 echo $verbose | $grep -q yes && echo ping name servers to confirm they are are available
 #
-# confirm primary name server is available
-#
 # We already have a list of the namservers, so use a for loop for check each nameserver one at a time.
+#
 for nameserver in $nameserver_list ; do
    echo $verbose | $grep -q yes && echo "   pinging name server $nameserver"
    pingreply=unknown
@@ -293,17 +325,23 @@ echo $verbose | $grep -q yes && echo confirm IP address is not 0.0.0.0
 #
 # NOTE: the output of the "host" command is slightly different on AIX and Linux
 # On Linux:
-#  $ host myhost.example.com
-#  myhost.example.com has address 192.168.14.19
+#    $ host myhost.example.com
+#    myhost.example.com has address 192.168.14.19
+#    $ /usr/bin/host host2.example.com
+#    Host host2.example.com not found: 3(NXDOMAIN)
 # On AIX:
-#  $ host myhost.example.com
-#  myhost.example.com is 192.168.14.19
+#    $ host myhost.example.com
+#    myhost.example.com is 192.168.14.19
+#    $ /usr/bin/host host2.example.com
+#    host: 0827-801 Host name host2.example.com does not exist.
 #
 echo $verbose | $grep -q yes && echo "   getting hostname with: $hostname -s"
 host_name=`$hostname -s`
-echo $verbose | $grep -q yes && echo "   getting IP address with: $host $host_name.$domain_name | $sed -e 's/ is / /g' | $sed -e 's/ has address / /g' | $awk '{print $2}' | $sed -e 's/,//g'"
-host_ip=`$host $host_name.$domain_name | $sed -e 's/ is / /g' | $sed -e 's/ has address / /g' | $awk '{print $2}' | $sed -e 's/,//g'`
-echo $verbose | $grep -q yes && echo "   host_ip is $host_ip"
+echo $verbose | $grep -q yes && echo "   getting IP address with: $host $host_name.$domain_name"
+x=`$host $host_name.$domain_name 2>&1`
+echo $x | $grep -q -E "not found|does not exist" && host_ip=unknown
+echo $x | $grep -q -E " is |has address"         && host_ip=`echo $x | $sed -e 's/ is / /g' | $sed -e 's/ has address / /g' | $awk '{print $2}' | $sed -e 's/,//g'`
+echo $verbose | $grep -q yes && echo "   hostname is $host_name , host_ip is $host_ip"
 if [ "$host_ip" = "0.0.0.0" ]; then
    echo "$CHECK_NAME WARN - Found bogus IP address of 0.0.0.0 for $host_name.  Please check for bogus entries in the /etc/hosts file."
    exit $WARN
