@@ -437,7 +437,7 @@ function check_forward_resolution_localhost {
    #
    # We already have a list of nameservers, so use a for loop for check each nameserver one at a time.
    for nameserver in $nameserver_list ; do
-      host_name=localhost
+      localhost_name=localhost
       #
       # skip check if this is a DMZ host using assorted public name servers
       # if the host is using a public DNS server, the hostname localhost may or may not be resolvable by the public DNS server
@@ -453,11 +453,11 @@ function check_forward_resolution_localhost {
       if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
       #
       dnscheck=fail
-      echo $verbose | $grep -q yes && echo Checking forward name resolution for hostname $host_name A record against $nameserver DNS server
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver $host_name A | $grep -v '^;'"
-      $dig @$nameserver $host_name A  | $grep -v '^;' | $grep -q -i $host_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo $verbose | $grep -q yes && echo Checking forward name resolution for hostname $localhost_name A record against $nameserver DNS server
+      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver $localhost_name A | $grep -v '^;'"
+      $dig @$nameserver $localhost_name A  | $grep -v '^;' | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find an A record for $host_name in DNS.  Forward DNS lookups for $host_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add an A record for $host_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - Could not find an A record for $localhost_name in DNS.  Forward DNS lookups for $localhost_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add an A record for $localhost_name on the $nameserver DNS server."
          exit $WARN
       fi
    done
@@ -486,7 +486,7 @@ function check_reverse_resolution {
    # We already have a list of nameservers, so use a for loop to run queries against each nameserver
    for nameserver in $nameserver_list ; do
       host_name=`$hostname -s`
-      host_ip=`$host $host_name.$domain_name | $sed -e "s/ is / /g" | $sed -e "s/ has address / /g" | $awk '{print $2}' | $sed -e "s/,//g"`
+      # xxx host_ip=`$host $host_name.$domain_name | $sed -e "s/ is / /g" | $sed -e "s/ has address / /g" | $awk '{print $2}' | $sed -e "s/,//g"`
       #
       # The dig utility will show the PTR record using in-addr.arpa format.
       # For example, the IP address 1.2.3.4 will be displayed as 4.3.2.1.in-addr.arpa
@@ -568,12 +568,12 @@ function check_reverse_resolution_127_0_0_1 {
    #
    # We already have a list of nameservers, so use a for loop to run queries against each nameserver
    for nameserver in $nameserver_list ; do
-      host_name=localhost
-      host_ip=127.0.0.1
+      localhost_name=localhost
+      localhost_ip=127.0.0.1
       #
       # The dig utility will show the PTR record using in-addr.arpa format.
       # For example, the IP address 1.2.3.4 will be displayed as 4.3.2.1.in-addr.arpa
-      in_addr_arpa=`echo $host_ip | awk -F . '{print $4 "." $3 "." $2 "." $1 ".in-addr.arpa"}'`
+      in_addr_arpa=`echo $localhost_ip | awk -F . '{print $4 "." $3 "." $2 "." $1 ".in-addr.arpa"}'`
       #
       #
       # Skip check if this is a DMZ host using assorted public name servers
@@ -591,47 +591,47 @@ function check_reverse_resolution_127_0_0_1 {
       if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
       #
       dnscheck=fail
-      echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $host_ip or $in_addr_arpa PTR record against $nameserver name server"
+      echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $localhost_ip or $in_addr_arpa PTR record against $nameserver name server"
       #
       # We want to differentiate the PTR not existing at all from the PTR existing but pointing at the wrong A record.
       # This section only checks to see if the PTR record exists, but does not confirm it points to the correct A record.
       #
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $host_ip | $grep -v '^;' | $grep $in_addr_arpa  "
-      $dig @$nameserver -x $host_ip  | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $localhost_ip | $grep -v '^;' | $grep $in_addr_arpa  "
+      $dig @$nameserver -x $localhost_ip  | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find a PTR record for $host_ip in DNS.  Reverse DNS lookups for $host_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for $host_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - Could not find a PTR record for $localhost_ip in DNS.  Reverse DNS lookups for $localhost_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for $localhost_name on the $nameserver DNS server."
          exit $WARN
       fi
       #
       # We want to differentiate the PTR not existing at all from the PTR existing but pointing at the wrong A record.
       # We have already confirmed the PTR record exists, so this section confirms the PTR record points at the correct A record.
       #
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $host_ip | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -i $host_name  "
-      $dig @$nameserver -x $host_ip  | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -q -i $host_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $localhost_ip | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -i $localhost_name  "
+      $dig @$nameserver -x $localhost_ip  | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - PTR record for $host_ip exists in DNS, but does not point at the correct hostname. Please ask the DNS administrator to update the $host_ip PTR record to point at $host_name"
+         echo "$CHECK_NAME WARN - PTR record for $localhost_ip exists in DNS, but does not point at the correct hostname. Please ask the DNS administrator to update the $localhost_ip PTR record to point at $localhost_name"
          exit $WARN
       fi
       #
       # At this point, we know that the PTR record exists, so now we check to confirm that IP address is bound to a local network interface.
       # This allows us to differentiate between a PTR record not existing and a PTR record that points at the wrong host.
       #
-      echo $verbose | $grep -q yes && echo "Confirming $host_ip is bound to a local network interface"
+      echo $verbose | $grep -q yes && echo "Confirming $localhost_ip is bound to a local network interface"
       if [ -f "$ip" ]; then		#modern Linux distros have replaced /usr/sbin/ifconfig with /usr/sbin/ip
          dnscheck=fail
-         echo $verbose | $grep -q yes && echo "   running command:  $ip addr show | $grep -i $host_ip "
-         $ip addr show | $grep -q -i $host_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+         echo $verbose | $grep -q yes && echo "   running command:  $ip addr show | $grep -i $localhost_ip "
+         $ip addr show | $grep -q -i $localhost_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
          if [ "$dnscheck" = "fail" ]; then
-            echo "$CHECK_NAME WARN - PTR record for $host_ip is pointing at the wrong hostname. Please ask the DNS administrator to update the PTR record for IP address $host_ip to point at hostname $host_name on the $nameserver DNS server."
+            echo "$CHECK_NAME WARN - PTR record for $localhost_ip is pointing at the wrong hostname. Please ask the DNS administrator to update the PTR record for IP address $localhost_ip to point at hostname $localhost_name on the $nameserver DNS server."
             exit $WARN
          fi
       fi
       if [ -f "$ifconfig" ]; then	#legacy Linux distros and AIX are still using /usr/sbin/ifconfig instead of /usr/sbin/ip
          dnscheck=fail
-         echo $verbose | $grep -q yes && echo "   running command:  $ifconfig -a | $grep -i $host_ip "
-         $ifconfig -a | $grep -q $host_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+         echo $verbose | $grep -q yes && echo "   running command:  $ifconfig -a | $grep -i $localhost_ip "
+         $ifconfig -a | $grep -q $localhost_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
          if [ "$dnscheck" = "fail" ]; then
-            echo "$CHECK_NAME WARN - PTR record for $host_ip is pointing at the wrong hostname. Please ask the DNS administrator to update the PTR record for IP address $host_ip to point at hostname $host_name on the $nameserver DNS server."
+            echo "$CHECK_NAME WARN - PTR record for $localhost_ip is pointing at the wrong hostname. Please ask the DNS administrator to update the PTR record for IP address $localhost_ip to point at hostname $localhost_name on the $nameserver DNS server."
             exit $WARN
          fi
       fi
@@ -695,7 +695,7 @@ function print_output {
    # If we get this far, everything is good
    #
    host_name=`$hostname -s`
-   echo $CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=129.0.0.1 resolver=$resolver nameservers=$nameserver_list
+   echo $CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=$localhost_ip resolver=$resolver nameservers=$nameserver_list
    exit $OK
 }
 
@@ -714,9 +714,10 @@ get_domain_name_bind
 ping_name_servers
 check_ipaddr_all_zeros 
 check_forward_resolution
-check_forward_resolution_localhost 
+#check_forward_resolution_localhost 
 check_reverse_resolution
 check_reverse_resolution_127_0_0_1
 check_aix_netsvc
 check_aix_ipv6_loopback 
 print_output
+
