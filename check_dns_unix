@@ -17,6 +17,7 @@
 #  2019/03/11   njeffrey    Check IP addresses bound to network interfaces with ifconfig -a or ip addr show
 #  2022/05/17   njeffrey    Additional error-checks for Linux hosts using systemd-resolved for name resolution
 #  2022/05/17   njeffrey    Break up code into functions
+#  2022/06/20   njeffrey    Add nagios performance data to output 
 
 
 
@@ -695,7 +696,8 @@ function print_output {
    # If we get this far, everything is good
    #
    host_name=`$hostname -s`
-   echo $CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=$localhost_ip resolver=$resolver nameservers=$nameserver_list
+   perf_data="nameserver_count:$nscount;;;;"
+   echo "$CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=$localhost_ip resolver=$resolver nameservers=$nameserver_list | $perf_data "
    exit $OK
 }
 
@@ -714,7 +716,7 @@ get_domain_name_bind
 ping_name_servers
 check_ipaddr_all_zeros 
 check_forward_resolution
-#check_forward_resolution_localhost 
+check_forward_resolution_localhost 
 check_reverse_resolution
 check_reverse_resolution_127_0_0_1
 check_aix_netsvc
