@@ -18,6 +18,7 @@
 #  2022/05/17   njeffrey    Additional error-checks for Linux hosts using systemd-resolved for name resolution
 #  2022/05/17   njeffrey    Break up code into functions
 #  2022/06/20   njeffrey    Add nagios performance data to output 
+#  2022/08/23   njeffrey    Bug fix in performance data output s/:/=/ 
 
 
 
@@ -696,7 +697,7 @@ function print_output {
    # If we get this far, everything is good
    #
    host_name=`$hostname -s`
-   perf_data="nameserver_count:$nscount;;;;"
+   perf_data="nameserver_count=$nscount;;;;"
    echo "$CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=$localhost_ip resolver=$resolver nameservers=$nameserver_list | $perf_data "
    exit $OK
 }
