@@ -18,7 +18,7 @@
 #  2022/05/17   njeffrey    Additional error-checks for Linux hosts using systemd-resolved for name resolution
 #  2022/05/17   njeffrey    Break up code into functions
 #  2022/06/20   njeffrey    Add nagios performance data to output 
-#  2022/08/23   njeffrey    Bug fix in performance data output s/:/=/ 
+#  2022/09/26   njeffrey    Remove bash-ism "function" keyword, does not work on /usr/bin/dash on Ubuntu
 
 
 
@@ -70,7 +70,7 @@
 # ./check_dns_unix: 161: [: somevalue: unexpected operator
 
 
-function declare_variables {
+declare_variables() {
    #
    # nagios return codes - this script returns a value to nagios for processing
    #
@@ -116,7 +116,7 @@ function declare_variables {
 
 
 
-function sanity_checks {
+sanity_checks() {
    #
    # Confirm required files exist
    #
@@ -147,7 +147,7 @@ function sanity_checks {
 
 
 
-function get_os {
+get_os() {
    #
    # Confirm the script is running under a supported operating system
    # So far, only AIX and Linux have been tested.  If you test other operating systems, please provide feedback to the author.
@@ -188,7 +188,7 @@ function get_os {
 
 
 
-function check_resolv_conf {
+check_resolv_conf() {
    #
    # Confirm /etc/resolv.conf exists
    #
@@ -211,19 +211,19 @@ function check_resolv_conf {
 
 
 
-function check_resolver {
+check_resolver() {
    #
    # Figure out if systemd-resolved is being used for name resolution
    # bind is the default on AIX and older versions of Linux.  Ubuntu 18+ use systemd-resolved instead of bind.
    #
    resolver=bind
-   $ps -ef | $grep -v $grep | $grep -q -i systemd-resolved && resolver=systemd-resolved
+   test -f /run/systemd/resolve/resolv.conf && resolver=systemd-resolved
 }
 
 
 
 
-function get_nameserver_list {
+get_nameserver_list() {
    # Get the list of nameservers
    #
    # If the local machine is not using systemd-resolved for name resolution, get the nameservers from /etc/resolv.conf
@@ -231,11 +231,10 @@ function get_nameserver_list {
       nameserver_list=`$grep ^nameserver /etc/resolv.conf | $awk '{print $2}' | $tr -s '\n' ' ' | $sed -e 's/ $//'`
    fi
    #
-   # If the local machine is using systemd-resolved for name resolution, query systemd-resolved to get the upstream nameservers
-   # The grep -A parameter assumes the use of GNU grep, which should be fine on any host running systemd-resolved
+   # If the local machine is using systemd-resolved for name resolution, get the nameservers from /run/systemd/resolve/resolv.conf
    if [ "$resolver" = "systemd-resolved" ]; then
       echo $verbose | $grep -q yes && echo "Detected systemd-resolved, will use for name resolution."
-      nameserver_list=`systemd-resolve --status | grep -A 1 "DNS Servers" | sed -e "s/DNS Servers://g" | $awk '{print $1}' | $tr -s '\n' ' '`
+      nameserver_list=`$grep ^nameserver /run/systemd/resolve/resolv.conf | $awk '{print $2}' | $tr -s '\n' ' ' | $sed -e 's/ $//'`
    fi
    #
    echo $verbose | $grep -q yes && echo "found nameservers $nameserver_list"
@@ -244,11 +243,11 @@ function get_nameserver_list {
 
 
 
-function get_nameserver_count {
+get_nameserver_count() {
    #
    # Figure out how many nameservers are configured for use
    # Legacy UNIX hosts will have their nameservers listed in /etc/resolv.conf
-   # Linux hosts using systemd-resolved will have their nameservers retrieved from the output of systemd-resolve --status
+   # Linux hosts using systemd-resolved will have their nameservers listed in /run/systemd/resolve/resolv.conf
    # The list of nameservers was retrieved in the previous section
    #
    nscount=0
@@ -272,20 +271,23 @@ function get_nameserver_count {
 
 
 
-function get_domain_name_systemd_resolved {
+get_domain_name_systemd_resolved() {
    #
    # if resolver=systemd-resolved, confirm a DNS domain name is defined
    # Sample command ouput:
-   # # systemd-resolve --status | tail -n 3
+   # # systemd-resolve --status | tail -n 4
    #   DNS Servers: 8.8.8.8
    #                8.8.4.4
-   #    DNS Domain: example.com
+   #   DNS Domain: example.com
+   #   search example.com
    #
    if [ "$resolver" = "systemd-resolved" ]; then
       domain_name=unknown
-      systemd-resolve --status | $grep -q "DNS Domain:" && domain_name=`systemd-resolve --status | $grep "DNS Domain:" | $awk '{print $3}'`
+      $grep -q "^DNS Domain" /run/systemd/resolve/resolv.conf && search=`$grep "^DNS Domain" /run/systemd/resolve/resolv.conf | awk '{print $3}'`
+      echo $verbose | $grep -q yes && echo Domain name is $domain_name
       search=unknown
-      $grep -q ^search /etc/resolv.conf && search=`$grep ^search /etc/resolv.conf | awk '{print $2}'`
+      $grep -q ^search /run/systemd/resolve/resolv.conf && search=`$grep ^search /run/systemd/resolve/resolv.conf | awk '{print $2}'` && domain_name=$search
+      echo $verbose | $grep -q yes && echo search is $search
       if [ "$domain_name" = "unknown" ] && [ "$search" = "unknown" ]; then
          #for Ubuntu using netplan
          test -d /etc/netplan             && echo "$CHECK_NAME WARN - Missing DNS Domain name from systemd-resolve --status output.  Please define your default domain name in /etc/netplan/*.yml"  && exit $WARN
@@ -300,7 +302,7 @@ function get_domain_name_systemd_resolved {
 
 
 
-function get_domain_name_bind {
+get_domain_name_bind() {
    #
    # if resolver=bind, confirm /etc/resolv.conf contains the "domain" or "search" parameters
    #
@@ -326,7 +328,7 @@ function get_domain_name_bind {
 
 
 
-function ping_name_servers {
+ping_name_servers() {
    #
    # ping name servers
    #
@@ -348,7 +350,7 @@ function ping_name_servers {
 
 
 
-function check_ipaddr_all_zeros {
+check_ipaddr_all_zeros() {
    #
    # Confirm IP address is not 0.0.0.0  or 127.0.1.1
    # This can be caused by a bogus entry in /etc/hosts
@@ -387,7 +389,7 @@ function check_ipaddr_all_zeros {
 
 
 
-function check_forward_resolution {
+check_forward_resolution() {
    #
    # Confirm A record for the current hostname exists in DNS for forward resolution
    #
@@ -427,7 +429,7 @@ function check_forward_resolution {
 
 
 
-function check_forward_resolution_localhost {
+check_forward_resolution_localhost() {
    #
    # Confirm A record for localhost exists in DNS for forward resolution
    #
@@ -468,7 +470,7 @@ function check_forward_resolution_localhost {
 
 
 
-function check_reverse_resolution {
+check_reverse_resolution() {
    #
    # Confirm PTR record for the current hostname exists in DNS for reverse resolution
    #
@@ -518,7 +520,7 @@ function check_reverse_resolution {
       echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $host_ip | $grep -v '^;' | $grep $in_addr_arpa  "
       $dig @$nameserver -x $host_ip  | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find a PTR record for $host_ip in DNS.  Reverse DNS lookups for $host_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for IP address $host_ip pointing at hostname $host_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - Could not find a PTR record for $host_ip in DNS.  Reverse DNS lookups for $host_name.$domain_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for IP address $host_ip pointing at hostname $host_name.$domain_name on the $nameserver DNS server."
          exit $WARN
       fi
       #
@@ -550,7 +552,7 @@ function check_reverse_resolution {
 
 
 
-function check_reverse_resolution_127_0_0_1 {
+check_reverse_resolution_127_0_0_1() {
    #
    # Confirm PTR record for 127.0.0.1 exists in DNS for reverse resolution
    #
@@ -643,7 +645,7 @@ function check_reverse_resolution_127_0_0_1 {
 
 
 
-function check_aix_netsvc {
+check_aix_netsvc() {
    #
    # For AIX hosts, confirm the order used for name resolution is the local /etc/hosts file, followed by DNS.
    #
@@ -669,7 +671,7 @@ function check_aix_netsvc {
 
 
 
-function check_aix_ipv6_loopback {
+check_aix_ipv6_loopback() {
    #
    # For AIX hosts, confirm lo0 ethernet adapter has an IPv6 address of ::1
    # This is required for the SNMP daemons on AIX 7.x
@@ -692,7 +694,7 @@ function check_aix_ipv6_loopback {
 
 
 
-function print_output {
+print_output() {
    #
    # If we get this far, everything is good
    #
