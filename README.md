@@ -35,3 +35,8 @@ If you are using the NRPE method, you will also need a command definition simila
 ```
     command[check_dns_unix]=/usr/local/nagios/libexec/check_dns_unix
 ```
+
+# Output
+```
+DNS OK hostname=myserver.example.com ipaddr=192.168.99.19 localhost=127.0.0.1 resolver=bind nameservers=192.168.99.3 192.168.99.4
+```
