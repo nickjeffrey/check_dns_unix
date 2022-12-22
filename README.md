@@ -4,6 +4,7 @@ nagios check to verify DNS configuration for UNIX-like operating systems.  The f
    - confirm PTR record returned by DNS match an IP address bound to a local ethernet interface
    - confirm the local IP address is not 0.0.0.0
    - confirm that localhost resolves to 127.0.0.1
+   - confirm that 127.0.0.1 is bound to a local ethernet interface
    - confirm default DNS domain suffix is defined
    - ping each defined DNS server
    
