@@ -45,6 +45,16 @@ If you are using the NRPE method, you will also need a command definition simila
 ```
 
 # Output
+Command output will look similar to one of the following:
 ```
 DNS OK hostname=myserver.example.com ipaddr=192.168.99.19 localhost=127.0.0.1 resolver=bind nameservers=192.168.99.3 192.168.99.4
+```
+```
+DNS WARN - Missing domain and search parameters from /etc/resolv.conf.  Please add an entry similar to one or both of the following:  domain example.com  search example.com
+```
+```
+DNS WARN - Could not find an A record for MyServer in DNS.  Forward DNS lookups for MyServer are failing against the 192.168.99.3 DNS server.  Please ask the DNS administrator to add an A record for MyServer on the 192.168.99.3 DNS server.
+```
+```
+DNS WARN - PTR record for 192.168.99.143 is pointing at hostname MyServer, but the IP address 192.168.99.143 is not bound to any network interface on MyServer. Please fix up the A and PTR records for hostname MyServer on DNS server 192.168.99.3, or add IP address 192.168.99.143 to a network interface on MyServer.
 ```
