@@ -48,7 +48,7 @@ If you are using the NRPE method, you will also need a command definition simila
 # Output
 Command output will look similar to one of the following:
 ```
-DNS OK hostname=myserver.example.com ipaddr=192.168.99.19 localhost=127.0.0.1 resolver=bind nameservers=192.168.99.3 192.168.99.4
+DNS OK hostname=myserver.example.com ipaddr=192.168.99.143 localhost=127.0.0.1 resolver=bind nameservers=192.168.99.3 192.168.99.4
 ```
 ```
 DNS WARN - Missing domain and search parameters from /etc/resolv.conf.  Please add an entry similar to one or both of the following:  domain example.com  search example.com
