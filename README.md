@@ -3,7 +3,7 @@ nagios check to verify DNS configuration for UNIX-like operating systems.  The f
    - confirm the current machine has forward and reverse name resolution (A and PTR records in DNS)
    - confirm the local IP address is not 0.0.0.0
    - confirm that localhost resolves to 127.0.0.1
-   - confirm default DNS domain is defined
+   - confirm default DNS domain suffix is defined
 
 
 # Requirements
