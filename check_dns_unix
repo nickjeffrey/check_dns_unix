@@ -2,9 +2,8 @@
 
 # OUTSTANDING TASKS
 # -----------------
-#  1. Already tested on AIX and CentOS.  Not tested on Ubuntu,SunOS,HPUX,*BSD,MacOS.  If you test on a new UNIX flavour, please inform the author.
+#  1. Already tested on AIX,CentOS,Ubuntu,FreeBSD,OpenBSD.  Not tested on Ubuntu,SunOS,HPUX,MacOS.  If you test on a new UNIX flavour, please inform the author.
 #  2. Check to see if modern FreeBSD is using a local nameserver cache instead of BIND
-#  3. Detect runining OS and set appropriate switches for ps   (use -ef on AIX and Linux, -aux on *BSD and MacOS)
 
 
 # CHANGE LOG
@@ -19,6 +18,8 @@
 #  2022/05/17   njeffrey    Break up code into functions
 #  2022/06/20   njeffrey    Add nagios performance data to output 
 #  2022/09/26   njeffrey    Remove bash-ism "function" keyword, does not work on /usr/bin/dash on Ubuntu
+#  2022/12/22   njeffrey    Add support for OpenBSD
+#  2022/12/22   njeffrey    The "dig" and "nslookup" packages do not exist on FreeBSD (because BIND removed from base in FreeBSD 10.x, replaced with unbound resolved, use drill instead)
 
 
 
@@ -26,18 +27,20 @@
 # -----
 # nagios check to perform the following DNS sanity checks:
 #   - confirm the current machine has forward and reverse name resolution (A and PTR records in DNS)
+#   - confirm PTR record returned by DNS match an IP address bound to a local ethernet interface
 #   - confirm the local IP address is not 0.0.0.0
 #   - confirm that localhost resolves to 127.0.0.1
+#   - confirm default DNS domain suffix is defined
+#   - ping each defined DNS server
 #
-#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
-#  methods available in nagios.
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
 #
 #  If you hare using the check_by_ssh method, you will need a section in the services.cfg
 #  file on the nagios server that looks similar to the following.
 #  This assumes that you already have ssh key pairs configured.
 #      define service {
 #              use                             generic-service
-#              hostgroup_name                  all_aix,all_linux
+#              hostgroup_name                  all_aix,all_freebsd,all_linux
 #              service_description             DNS
 #              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_dns_unix
 #              }
@@ -47,7 +50,7 @@
 #  the services.cfg file:
 #      define service{
 #               use                             generic-service
-#               hostgroup_name                  all_aix,all_linux
+#               hostgroup_name                  all_aix,all_freebsd,all_linux
 #               service_description             DNS
 #               check_command                   check_nrpe!check_dns_unix -t 30
 #               normal_check_interval           240     ; only check every 4 hours
@@ -84,33 +87,38 @@ declare_variables() {
    #
    verbose=no
    awk=/usr/bin/awk
-   wc=/usr/bin/wc
    tr=/usr/bin/tr
-   ps=/bin/ps
    host=/usr/bin/host
-   ifconfig=/usr/sbin/ifconfig
    dig=/usr/bin/dig
+   drill=/usr/bin/drill
+   expr=/usr/bin/expr
+   if [ -f "/usr/bin/expr" ];      then expr=/usr/bin/expr          ; fi   #location on CentOS
+   if [ -f "/bin/expr" ];          then expr=/bin/expr              ; fi   #location on OpenBSD
+   ifconfig=/usr/sbin/ifconfig
+   if [ -f "/sbin/ifconfig" ];     then ifconfig=/sbin/ifconfig     ; fi   #location on OpenBSD
+   if [ -f "/usr/sbin/ifconfig" ]; then ifconfig=/usr/sbin/ifconfig ; fi   #location on CentOS
    ip=/sbin/ip
-   if [ -f "/sbin/ip" ];           then ip=/sbin/ip                ; fi	#location on Ubuntu
-   if [ -f "/usr/sbin/ip" ];       then ip=/usr/sbin/ip            ; fi	#location on CentOS
+   if [ -f "/sbin/ip" ];           then ip=/sbin/ip                 ; fi   #location on Ubuntu
+   if [ -f "/usr/sbin/ip" ];       then ip=/usr/sbin/ip             ; fi   #location on CentOS
    ping=/bin/ping
-   if [ -f "/bin/ping" ];          then ping=/bin/ping             ; fi	#location on CentOS
-   if [ -f "/etc/ping" ];          then ping=/etc/ping             ; fi	#location on AIX
+   if [ -f "/sbin/ping" ];         then ping=/sbin/ping             ; fi   #location on OpenBSD
+   if [ -f "/bin/ping" ];          then ping=/bin/ping              ; fi   #location on CentOS
+   if [ -f "/etc/ping" ];          then ping=/etc/ping              ; fi   #location on AIX
    grep=/bin/grep
-   if [ -f "/bin/grep" ];          then grep=/bin/grep             ; fi	#location on CentOS
-   if [ -f "/usr/bin/grep" ];      then grep=/usr/bin/grep         ; fi	#location on AIX
+   if [ -f "/bin/grep" ];          then grep=/bin/grep              ; fi   #location on CentOS
+   if [ -f "/usr/bin/grep" ];      then grep=/usr/bin/grep          ; fi   #location on AIX
    sed=/usr/bin/sed
-   if [ -f "/bin/sed" ];           then sed=/bin/sed               ; fi	#location on CentOS
-   if [ -f "/usr/bin/sed" ];       then sed=/usr/bin/sed           ; fi	#location on AIX
+   if [ -f "/bin/sed" ];           then sed=/bin/sed                ; fi   #location on CentOS
+   if [ -f "/usr/bin/sed" ];       then sed=/usr/bin/sed            ; fi   #location on AIX
    cat=/usr/bin/cat
-   if [ -f "/bin/cat" ];           then cat=/bin/cat               ; fi	#location on CentOS
-   if [ -f "/usr/bin/cat" ];       then cat=/usr/bin/cat           ; fi	#location on AIX
+   if [ -f "/bin/cat" ];           then cat=/bin/cat                ; fi   #location on CentOS
+   if [ -f "/usr/bin/cat" ];       then cat=/usr/bin/cat            ; fi   #location on AIX
    hostname=/usr/bin/hostname
-   if [ -f "/bin/hostname" ];      then hostname=/bin/hostname     ; fi	#location on CentOS 
-   if [ -f "/usr/bin/hostname" ];  then hostname=/usr/bin/hostname ; fi	#location on AIX
+   if [ -f "/bin/hostname" ];      then hostname=/bin/hostname      ; fi   #location on CentOS 
+   if [ -f "/usr/bin/hostname" ];  then hostname=/usr/bin/hostname  ; fi   #location on AIX
    uname=/usr/bin/uname
-   if [ -f "/bin/uname" ];         then uname=/bin/uname           ; fi	#location on CentOS
-   if [ -f "/usr/bin/uname" ];     then uname=/usr/bin/uname       ; fi	#location on AIX
+   if [ -f "/bin/uname" ];         then uname=/bin/uname            ; fi   #location on CentOS
+   if [ -f "/usr/bin/uname" ];     then uname=/usr/bin/uname        ; fi   #location on AIX
 }
 
 
@@ -123,7 +131,7 @@ sanity_checks() {
    echo $verbose | $grep -q yes && echo confirm required files exist
    #
    # test for the existence of a bunch of utilities by using a quick and dirty for loop
-   for testfile in $awk $sed $grep $wc $tr $ps $cat $hostname $uname $host $ping $dig
+   for testfile in $awk $sed $grep $tr $hostname $uname $host $ping $expr
    do
       if [ ! -f "$testfile" ]; then
          echo "$CHECK_NAME UNKNOWN required file $testfile not found "
@@ -133,15 +141,21 @@ sanity_checks() {
          echo "$CHECK_NAME UNKNOWN required file $testfile is not executable by the nagios user "
          exit $UNKNOWN
       fi
-      # 
-      #    
-      # Modern linux distros have replaced /usr/sbin/ifconfig with /usr/sbin/ip
-      # At least one of these programs must exist
-      if [ ! -f "$ifconfig" ] && [ ! -f "$ip" ] ; then
-         echo ERROR: Cannot find $ifconfig or $ip - cannot lookup local IP address
-         exit $UNKNOWN
-      fi
    done
+   # 
+   # Modern Linux distros have replaced /usr/sbin/ifconfig with /usr/sbin/ip
+   # At least one of these programs must exist
+   if [ ! -f "$ifconfig" ] && [ ! -f "$ip" ] ; then
+      echo ERROR: Cannot find $ifconfig or $ip - cannot lookup local IP address
+      exit $UNKNOWN
+   fi
+   # 
+   # FreeBSD 10.x and newer distros have replaced BIND with unbound, so /usr/bin/dig has been replaced with /usr/bin/drill
+   # At least one of these programs must exist
+   if [ ! -f "$dig" ] && [ ! -f "$drill" ] ; then
+      echo ERROR: Cannot find $dig or $drill - cannot lookup local IP address
+      exit $UNKNOWN
+   fi
 }
 
 
@@ -160,16 +174,14 @@ get_os() {
       echo $verbose | $grep -q yes && echo "  Detected Linux"
    fi
    if [ "$os" = "FreeBSD" ] ; then
-      echo $CHECK_NAME UNKNOWN detected unsupported $os operating system.  Please test on $os and inform the author if updates are required.
-      exit $UNKOWN
+      echo $verbose | $grep -q yes && echo "  Detected FreeBSD"
+      echo $verbose | $grep -q yes && echo "  Detected FreeBSD - using $drill instead of $dig"
    fi
    if [ "$os" = "OpenBSD" ] ; then
-      echo $CHECK_NAME UNKNOWN detected unsupported $os operating system.  Please test on $os and inform the author if updates are required.
-      exit $UNKOWN
+      echo $verbose | $grep -q yes && echo "  Detected OpenBSD"
    fi
    if [ "$os" = "NetBSD" ] ; then
-      echo $CHECK_NAME UNKNOWN detected unsupported $os operating system.  Please test on $os and inform the author if updates are required.
-      exit $UNKOWN
+      echo $verbose | $grep -q yes && echo "  Detected NetBSD"
    fi
    if [ "$os" = "MacOS" ] ; then
       echo $CHECK_NAME UNKNOWN detected unsupported $os operating system.  Please test on $os and inform the author if updates are required.
@@ -215,9 +227,11 @@ check_resolver() {
    #
    # Figure out if systemd-resolved is being used for name resolution
    # bind is the default on AIX and older versions of Linux.  Ubuntu 18+ use systemd-resolved instead of bind.
+   # FreeBSD 10.x and later use unbound
    #
    resolver=bind
    test -f /run/systemd/resolve/resolv.conf && resolver=systemd-resolved
+   test -f $drill && resolver=unbound
 }
 
 
@@ -226,8 +240,8 @@ check_resolver() {
 get_nameserver_list() {
    # Get the list of nameservers
    #
-   # If the local machine is not using systemd-resolved for name resolution, get the nameservers from /etc/resolv.conf
-   if [ "$resolver" = "bind" ]; then
+   # If the local machine is using bind or unbound for name resolution, get the nameservers from /etc/resolv.conf
+   if [ "$resolver" = "bind" ] || [ "$resolver" = "unbound" ]; then
       nameserver_list=`$grep ^nameserver /etc/resolv.conf | $awk '{print $2}' | $tr -s '\n' ' ' | $sed -e 's/ $//'`
    fi
    #
@@ -253,7 +267,7 @@ get_nameserver_count() {
    nscount=0
    for i in $nameserver_list ; do
       echo $verbose | $grep -q yes && echo "   nscount = $nscount + 1"
-      nscount=`expr $nscount + 1`
+      nscount=`$expr $nscount + 1`
    done
    echo $verbose | $grep -q yes && echo    found $nscount name servers $nameserver_list
    #
@@ -283,7 +297,7 @@ get_domain_name_systemd_resolved() {
    #
    if [ "$resolver" = "systemd-resolved" ]; then
       domain_name=unknown
-      $grep -q "^DNS Domain" /run/systemd/resolve/resolv.conf && search=`$grep "^DNS Domain" /run/systemd/resolve/resolv.conf | awk '{print $3}'`
+      $grep -q "^DNS Domain" /run/systemd/resolve/resolv.conf && search=`$grep "^DNS Domain" /run/systemd/resolve/resolv.conf | $awk '{print $3}'`
       echo $verbose | $grep -q yes && echo Domain name is $domain_name
       search=unknown
       $grep -q ^search /run/systemd/resolve/resolv.conf && search=`$grep ^search /run/systemd/resolve/resolv.conf | awk '{print $2}'` && domain_name=$search
@@ -302,11 +316,11 @@ get_domain_name_systemd_resolved() {
 
 
 
-get_domain_name_bind() {
+get_domain_name_bind_or_unbound() {
    #
-   # if resolver=bind, confirm /etc/resolv.conf contains the "domain" or "search" parameters
+   # if resolver is bind or unbound, confirm /etc/resolv.conf contains the "domain" or "search" parameters
    #
-   if [ "$resolver" = "bind" ]; then
+   if [ "$resolver" = "bind" ] || [ "$resolver" = "unbound" ] ; then
       domain_name=unknown
       $grep -q ^domain /etc/resolv.conf && domain_name=`$grep ^domain /etc/resolv.conf | awk '{print $2}'`
       search=unknown
@@ -375,7 +389,7 @@ check_ipaddr_all_zeros() {
    x=`$host $host_name.$domain_name 2>&1`
    echo $x | $grep -q -E "not found|does not exist" && host_ip=unknown
    echo $x | $grep -q -E " is |has address"         && host_ip=`echo $x | $sed -e 's/ is / /g' | $sed -e 's/ has address / /g' | $awk '{print $2}' | $sed -e 's/,//g'`
-   echo $verbose | $grep -q yes && echo "   hostname is $host_name , host_ip is $host_ip"
+   echo $verbose | $grep -q yes && echo "   hostname is $host_name , domain name is $domain_name , host_ip is $host_ip"
    if [ "$host_ip" = "0.0.0.0" ]; then
       echo "$CHECK_NAME WARN - Found bogus IP address of 0.0.0.0 for $host_name.  Please check for bogus entries in the /etc/hosts file."
       exit $WARN
@@ -416,9 +430,11 @@ check_forward_resolution() {
       if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
       #
       dnscheck=fail
+      if [ -f "$dig"   ]; then command="$dig      @$nameserver    $host_name.$domain_name" ; fi   #command for AIX,Linux,OpenBSD
+      if [ -f "$drill" ]; then command="$drill    @$nameserver    $host_name.$domain_name" ; fi   #command for FreeBSD (uses drill instead of dig)
       echo $verbose | $grep -q yes && echo Checking name resolution for hostname $host_name.$domain_name A record against $nameserver DNS server
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver $host_name.$domain_name A | $grep -v '^;'"
-      $dig @$nameserver $host_name.$domain_name A  | $grep -v '^;' | $grep -q -i $host_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;'"
+      $command | $grep -v '^;' | $grep -q -i $host_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
          echo "$CHECK_NAME WARN - Could not find an A record for $host_name in DNS.  Forward DNS lookups for $host_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add an A record for $host_name on the $nameserver DNS server."
          exit $WARN
@@ -457,9 +473,11 @@ check_forward_resolution_localhost() {
       if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
       #
       dnscheck=fail
+      if [ -f "$dig"   ]; then command="$dig      @$nameserver    $localhost_name A" ; fi   #command for AIX,Linux,OpenBSD
+      if [ -f "$drill" ]; then command="$drill    @$nameserver    $localhost_name A" ; fi   #command for FreeBSD (uses drill instead of dig)
       echo $verbose | $grep -q yes && echo Checking forward name resolution for hostname $localhost_name A record against $nameserver DNS server
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver $localhost_name A | $grep -v '^;'"
-      $dig @$nameserver $localhost_name A  | $grep -v '^;' | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;'"
+      $command | $grep -v '^;' | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
          echo "$CHECK_NAME WARN - Could not find an A record for $localhost_name in DNS.  Forward DNS lookups for $localhost_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add an A record for $localhost_name on the $nameserver DNS server."
          exit $WARN
@@ -516,9 +534,11 @@ check_reverse_resolution() {
       # In other words, this section confirms the PTR record exists, but not that the PTR record points at the correct host.
       #
       dnscheck=fail
+      if [ -f "$dig"   ]; then command="$dig      @$nameserver -x $host_ip" ; fi #command for AIX,Linux,OpenBSD
+      if [ -f "$drill" ]; then command="$drill -x @$nameserver    $host_ip" ; fi #command for FreeBSD (uses drill instead of dig)
       echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $host_ip or $in_addr_arpa PTR record against $nameserver name server"
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $host_ip | $grep -v '^;' | $grep $in_addr_arpa  "
-      $dig @$nameserver -x $host_ip  | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      #echo $verbose | $grep -q yes && echo "   running command:  $cmmand | $grep -v '^;' | $grep $in_addr_arpa  "
+      $command | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
          echo "$CHECK_NAME WARN - Could not find a PTR record for $host_ip in DNS.  Reverse DNS lookups for $host_name.$domain_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for IP address $host_ip pointing at hostname $host_name.$domain_name on the $nameserver DNS server."
          exit $WARN
@@ -600,8 +620,10 @@ check_reverse_resolution_127_0_0_1() {
       # We want to differentiate the PTR not existing at all from the PTR existing but pointing at the wrong A record.
       # This section only checks to see if the PTR record exists, but does not confirm it points to the correct A record.
       #
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $localhost_ip | $grep -v '^;' | $grep $in_addr_arpa  "
-      $dig @$nameserver -x $localhost_ip  | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      if [ -f "$dig"   ]; then command="$dig      @$nameserver -x $localhost_ip" ; fi #command for AIX,Linux,OpenBSD
+      if [ -f "$drill" ]; then command="$drill -x @$nameserver    $localhost_ip" ; fi #command for FreeBSD (uses drill instead of dig)
+      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;' | $grep $in_addr_arpa  "
+      $command | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
          echo "$CHECK_NAME WARN - Could not find a PTR record for $localhost_ip in DNS.  Reverse DNS lookups for $localhost_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for $localhost_name on the $nameserver DNS server."
          exit $WARN
@@ -610,8 +632,8 @@ check_reverse_resolution_127_0_0_1() {
       # We want to differentiate the PTR not existing at all from the PTR existing but pointing at the wrong A record.
       # We have already confirmed the PTR record exists, so this section confirms the PTR record points at the correct A record.
       #
-      echo $verbose | $grep -q yes && echo "   running command:  $dig @$nameserver -x $localhost_ip | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -i $localhost_name  "
-      $dig @$nameserver -x $localhost_ip  | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -i $localhost_name  "
+      $command | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
       if [ "$dnscheck" = "fail" ]; then
          echo "$CHECK_NAME WARN - PTR record for $localhost_ip exists in DNS, but does not point at the correct hostname. Please ask the DNS administrator to update the $localhost_ip PTR record to point at $localhost_name"
          exit $WARN
@@ -715,7 +737,7 @@ check_resolver
 get_nameserver_list 
 get_nameserver_count
 get_domain_name_systemd_resolved 
-get_domain_name_bind
+get_domain_name_bind_or_unbound
 ping_name_servers
 check_ipaddr_all_zeros 
 check_forward_resolution
