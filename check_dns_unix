@@ -2,8 +2,7 @@
 
 # OUTSTANDING TASKS
 # -----------------
-#  1. Already tested on AIX,CentOS,Ubuntu,FreeBSD,OpenBSD.  Not tested on Ubuntu,SunOS,HPUX,MacOS.  If you test on a new UNIX flavour, please inform the author.
-#  2. Check to see if modern FreeBSD is using a local nameserver cache instead of BIND
+#  1. Already tested on AIX,CentOS,Ubuntu,FreeBSD,OpenBSD.  Not tested on SunOS,HPUX,MacOS.  If you test on a new UNIX flavour, please inform the author.
 
 
 # CHANGE LOG
@@ -20,6 +19,7 @@
 #  2022/09/26   njeffrey    Remove bash-ism "function" keyword, does not work on /usr/bin/dash on Ubuntu
 #  2022/12/22   njeffrey    Add support for OpenBSD
 #  2022/12/22   njeffrey    The "dig" and "nslookup" packages do not exist on FreeBSD (because BIND removed from base in FreeBSD 10.x, replaced with unbound resolved, use drill instead)
+#  2023/08/22   njeffrey    Add capability to add $min_nameservers and $max_nameservers parameters as command line arguments
 
 
 
@@ -38,11 +38,12 @@
 #  If you hare using the check_by_ssh method, you will need a section in the services.cfg
 #  file on the nagios server that looks similar to the following.
 #  This assumes that you already have ssh key pairs configured.
+#  There are two optional parameters, which are the minimum (defaults to 2) and maximum (defaults to 3) number of defined name servers.
 #      define service {
 #              use                             generic-service
 #              hostgroup_name                  all_aix,all_freebsd,all_linux
 #              service_description             DNS
-#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_dns_unix
+#              check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_dns_unix 2 3"
 #              }
 #
 #
@@ -72,6 +73,20 @@
 # So, be sure to use only a single in your string comparison statements, or you will get this error:
 # ./check_dns_unix: 161: [: somevalue: unexpected operator
 
+
+
+#
+# check to see if user provided parameters for $min_nameservers $max_nameservers
+# Please note that this section must be in the main loop, not in a subroutine or function
+#
+min_nameservers=2						#default value is 2 for minimum number of name servers
+max_nameservers=3						#default value is 3 for maximum number of name servers
+if [ -n $1 ]; then						#check to see if user provided parameter 
+   min_nameservers=$1
+fi
+if [ -n $2 ]; then						#check to see if user provided parameter
+   max_nameservers=$2
+fi
 
 declare_variables() {
    #
@@ -272,12 +287,12 @@ get_nameserver_count() {
    echo $verbose | $grep -q yes && echo    found $nscount name servers $nameserver_list
    #
    #
-   if [ $nscount -lt 2 ]; then
-      echo "$CHECK_NAME WARN - Only $nscount nameserver entries in /etc/resolv.conf  Please note that the /etc/resolv.conf file should contain at least two nameserver lines."
+   if [ $nscount -lt $min_nameservers ]; then
+      echo "$CHECK_NAME WARN - Only $nscount nameserver entries in /etc/resolv.conf  Please note that the /etc/resolv.conf file should contain at least $min_nameservers nameserver lines."
       exit $WARN
    fi
-   if [ $nscount -gt 3 ]; then
-      echo "$CHECK_NAME WARN - There are $nscount nameserver entries in /etc/resolv.conf  Please note that the resolver can only use a maximum of 3 nameservers."
+   if [ $nscount -gt $max_nameservers ]; then
+      echo "$CHECK_NAME WARN - There are $nscount nameserver entries in /etc/resolv.conf  Please note that the resolver can only use a maximum of $max_nameservers nameservers."
       exit $WARN
    fi
 }
