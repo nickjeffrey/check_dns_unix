@@ -20,6 +20,7 @@
 #  2022/12/22   njeffrey    Add support for OpenBSD
 #  2022/12/22   njeffrey    The "dig" and "nslookup" packages do not exist on FreeBSD (because BIND removed from base in FreeBSD 10.x, replaced with unbound resolved, use drill instead)
 #  2023/08/22   njeffrey    Add capability to add $min_nameservers and $max_nameservers parameters as command line arguments
+#  2024/01/13   njeffrey    Add error checks for  $min_nameservers and $max_nameservers parameters 
 
 
 
@@ -75,18 +76,64 @@
 
 
 
+
+#
 #
 # check to see if user provided parameters for $min_nameservers $max_nameservers
 # Please note that this section must be in the main loop, not in a subroutine or function
 #
 min_nameservers=2						#default value is 2 for minimum number of name servers
 max_nameservers=3						#default value is 3 for maximum number of name servers
-if [ -n $1 ]; then						#check to see if user provided parameter 
-   min_nameservers=$1
+if [ "$#" -eq 0 ]; then      # "Found zero command line parameter"
+   min_nameservers=2						#default value is 2 for minimum number of name servers
+   max_nameservers=3						#default value is 3 for maximum number of name servers
 fi
-if [ -n $2 ]; then						#check to see if user provided parameter
-   max_nameservers=$2
+if [ "$#" -eq 1 ]; then      
+   if [ "$1" -eq "$1" ] 2>/dev/null; then   # Check if the argument is an integer
+      min_nameservers=$1
+   else
+      echo "ERROR: command line parameter $1 is not an integer."
+      exit 1
+   fi
 fi
+if [ "$#" -eq 2 ]; then
+   if [ "$1" -eq "$1" ] 2>/dev/null; then # Check if the argument is an integer
+      min_nameservers=$1
+   else
+      echo "ERROR: command line parameter $1 is not an integer."
+      exit 1
+   fi
+   if [ "$2" -eq "$2" ] 2>/dev/null; then # Check if the argument is an integer
+      max_nameservers=$2
+   else
+      echo "ERROR: command line parameter $2 is not an integer."
+      exit 1
+   fi
+fi
+if [ "$#" -gt 2 ]; then
+    echo "ERROR: Usage: $0 with 1 or 2 optional command line parameters for min_nameservers max_nameservers"
+    exit 1
+fi
+# confirm min_nameservers and max_nameservers are sane values
+if [ $min_nameservers -lt 1 ]; then
+    echo "ERROR: min_nameservers=$min_nameservers must be a minimum of 1 and a maximum of 3"
+    exit 1
+fi
+if [ $min_nameservers -gt 3 ]; then
+    echo "ERROR: min_nameservers must be a minimum of 1 and a maximum of 3"
+    exit 1
+fi
+if [ $min_nameservers -gt $max_nameservers ]; then
+    echo "ERROR: min_nameservers=$min_nameservers must be less than max_nameservers=$max_nameservers"
+    exit 1
+fi
+if [ $max_nameservers -gt 3 ]; then
+    echo "ERROR: max_nameservers=$max_nameservers must be less than or equal to 3"
+    exit 1
+fi
+
+
+
 
 declare_variables() {
    #
