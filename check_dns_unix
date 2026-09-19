@@ -20,7 +20,9 @@
 #  2022/12/22   njeffrey    Add support for OpenBSD
 #  2022/12/22   njeffrey    The "dig" and "nslookup" packages do not exist on FreeBSD (because BIND removed from base in FreeBSD 10.x, replaced with unbound resolved, use drill instead)
 #  2023/08/22   njeffrey    Add capability to add $min_nameservers and $max_nameservers parameters as command line arguments
-#  2024/01/13   njeffrey    Add error checks for  $min_nameservers and $max_nameservers parameters 
+#  2024/01/13   njeffrey    Add error checks for  $min_nameservers and $max_nameservers parameters
+#  2026/09/18   njeffrey    Add ping latency and packet loss checks for each DNS name server
+#  2026/09/18   njeffrey    Differentiate general DNS service failure from specific A/PTR query failure
 
 
 
@@ -32,7 +34,7 @@
 #   - confirm the local IP address is not 0.0.0.0
 #   - confirm that localhost resolves to 127.0.0.1
 #   - confirm default DNS domain suffix is defined
-#   - ping each defined DNS server
+#   - ping each defined DNS server, warn on high latency or packet loss
 #
 #  This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
 #
@@ -213,9 +215,17 @@ sanity_checks() {
    fi
    # 
    # FreeBSD 10.x and newer distros have replaced BIND with unbound, so /usr/bin/dig has been replaced with /usr/bin/drill
-   # At least one of these programs must exist
-   if [ ! -f "$dig" ] && [ ! -f "$drill" ] ; then
-      echo ERROR: Cannot find $dig or $drill - cannot lookup local IP address
+   # At least one of these programs must exist and be executable by the nagios user.
+   # Do not require both utilities because FreeBSD normally provides drill while AIX/Linux/OpenBSD use dig.
+   dns_utility=none
+   if [ -f "$dig" ] && [ -x "$dig" ]; then
+      dns_utility=$dig
+   fi
+   if [ -f "$drill" ] && [ -x "$drill" ]; then
+      dns_utility=$drill
+   fi
+   if [ "$dns_utility" = "none" ]; then
+      echo "$CHECK_NAME UNKNOWN - Cannot find an executable DNS query utility.  Expected $dig or $drill to exist and be executable by the nagios user."
       exit $UNKNOWN
    fi
 }
@@ -362,7 +372,7 @@ get_domain_name_systemd_resolved() {
       $grep -q "^DNS Domain" /run/systemd/resolve/resolv.conf && search=`$grep "^DNS Domain" /run/systemd/resolve/resolv.conf | $awk '{print $3}'`
       echo $verbose | $grep -q yes && echo Domain name is $domain_name
       search=unknown
-      $grep -q ^search /run/systemd/resolve/resolv.conf && search=`$grep ^search /run/systemd/resolve/resolv.conf | awk '{print $2}'` && domain_name=$search
+      $grep -q ^search /run/systemd/resolve/resolv.conf && search=`$grep ^search /run/systemd/resolve/resolv.conf | $awk '{print $2}'` && domain_name=$search
       echo $verbose | $grep -q yes && echo search is $search
       if [ "$domain_name" = "unknown" ] && [ "$search" = "unknown" ]; then
          #for Ubuntu using netplan
@@ -384,9 +394,9 @@ get_domain_name_bind_or_unbound() {
    #
    if [ "$resolver" = "bind" ] || [ "$resolver" = "unbound" ] ; then
       domain_name=unknown
-      $grep -q ^domain /etc/resolv.conf && domain_name=`$grep ^domain /etc/resolv.conf | awk '{print $2}'`
+      $grep -q ^domain /etc/resolv.conf && domain_name=`$grep ^domain /etc/resolv.conf | $awk '{print $2}'`
       search=unknown
-      $grep -q ^search /etc/resolv.conf && search=`$grep ^search /etc/resolv.conf | awk '{print $2}'`
+      $grep -q ^search /etc/resolv.conf && search=`$grep ^search /etc/resolv.conf | $awk '{print $2}'`
       if [ "$domain_name" = "unknown" ] && [ "$search" = "unknown" ]; then
          echo "$CHECK_NAME WARN - Missing domain and search parameters from /etc/resolv.conf.  Please add an entry similar to one or both of the following:  domain example.com  search example.com"
          exit $WARN
@@ -406,22 +416,138 @@ get_domain_name_bind_or_unbound() {
 
 ping_name_servers() {
    #
-   # ping name servers
+   # Ping each configured name server to confirm availability and measure latency and packet loss.
+   # The number of name servers is determined dynamically from $nameserver_list, so performance
+   # data is created for the actual number of configured DNS servers (normally 2 or 3).
    #
-   echo $verbose | $grep -q yes && echo ping name servers to confirm they are are available
+   # Do not parse the operating-system-specific ping summary line.  Instead, count
+   # individual replies and calculate average latency from the time= values.  This
+   # keeps the code portable across the assorted UNIX flavours supported by this check.
    #
-   # We already have a list of the namservers, so use a for loop for check each nameserver one at a time.
+   ping_count=5
+   ping_latency_warn=20		#milliseconds latency
+   ping_latency_crit=100        #milliseconds latency
+   ping_loss_warn=20            #percent packet loss
+   ping_loss_crit=50            #percent packet loss
+   ping_perf_data=""
+   ping_status=$OK
+   ping_status_text=""
+   dns1_server=""
+   dns1_ping_received=0
+   dns2_server=""
+   dns2_ping_received=0
+   dns3_server=""
+   dns3_ping_received=0
    #
+   echo $verbose | $grep -q yes && echo ping name servers to confirm they are available and measure latency and packet loss
+   #
+   # We already have a list of the nameservers, so use a for loop to check each nameserver one at a time.
+   # Do not exit on the first failure because we want latency/loss data for every configured DNS server.
+   #
+   ns_number=0
    for nameserver in $nameserver_list ; do
+      ns_number=`$expr $ns_number + 1`
       echo $verbose | $grep -q yes && echo "   pinging name server $nameserver"
-      pingreply=unknown
-      $ping -c 2 $nameserver | $grep -q "100% packet loss" && pingreply=failed
-      if [ "$pingreply" = "failed" ] ; then
-         echo "$CHECK_NAME WARN - could not ping name server $nameserver listed in /etc/resolv.conf.  Please confirm that $nameserver is a valid DNS server."
-         exit $WARN
+      #
+      # Capture ping output once so the same sample is used for both packet loss and latency.
+      #
+      ping_output=`$ping -c $ping_count $nameserver 2>&1`
+      echo $verbose | $grep -q yes && echo "$ping_output"
+      #
+      # Successful IPv4 ping replies on the supported UNIX flavours contain either
+      # time=VALUE or time<VALUE.  Count those replies rather than parsing the summary.
+      #
+      received=`echo "$ping_output" | $grep -E "time[=<]" | $awk 'END {print NR}'`
+      if [ -z "$received" ]; then
+         received=0
+      fi
+      #
+      # Calculate packet loss percentage.
+      #
+      packet_loss=`$awk -v sent="$ping_count" -v received="$received" 'BEGIN {printf "%.0f", ((sent-received)/sent)*100}'`
+      #
+      # Save the ping result for this specific DNS server.  Bourne shell does not
+      # support arrays, so use simple variables for the maximum of three name servers.
+      # These values are later used to distinguish an unreachable server from a
+      # reachable server whose DNS resolver is not responding.
+      #
+      case "$ns_number" in
+         1)
+            dns1_server=$nameserver
+            dns1_ping_received=$received
+            ;;
+         2)
+            dns2_server=$nameserver
+            dns2_ping_received=$received
+            ;;
+         3)
+            dns3_server=$nameserver
+            dns3_ping_received=$received
+            ;;
+      esac
+      #
+      # Calculate average round-trip latency in milliseconds from the individual replies.
+      # awk is used because Bourne shell arithmetic does not support floating point values.
+      #
+      if [ "$received" -gt 0 ]; then
+         latency=`echo "$ping_output" | $grep -E "time[=<]" | $sed -e 's/.*time[=<]//' -e 's/ *ms.*//' | $awk '{sum += $1; count++} END {if (count > 0) printf "%.3f", sum/count; else printf "0"}'`
+      else
+         latency=0
+      fi
+      #
+      echo $verbose | $grep -q yes && echo "   nameserver=$nameserver latency=${latency}ms packet_loss=${packet_loss}%"
+      #
+      # Add latency and packet loss to Nagios performance data.  dns1/dns2/dns3 are
+      # generated only when that DNS server actually exists in $nameserver_list.
+      #
+      ping_perf_data="${ping_perf_data} dns${ns_number}_latency=${latency}ms;${ping_latency_warn};${ping_latency_crit};; dns${ns_number}_loss=${packet_loss}%;${ping_loss_warn};${ping_loss_crit};0;100"
+      #
+      # Determine the state for this DNS server.  Retain the worst state, but continue
+      # checking the remaining DNS servers so all latency/loss performance data is returned.
+      #
+      server_status=$OK
+      server_status_text="DNS${ns_number}=$nameserver latency=${latency}ms loss=${packet_loss}%"
+      #
+      if [ "$packet_loss" -ge "$ping_loss_crit" ]; then
+         server_status=$CRITICAL
+      else
+         if [ "$packet_loss" -ge "$ping_loss_warn" ]; then
+            server_status=$WARN
+         fi
+      fi
+      #
+      latency_critical=`$awk -v latency="$latency" -v threshold="$ping_latency_crit" 'BEGIN {if (latency >= threshold) print "yes"; else print "no"}'`
+      latency_warning=` $awk -v latency="$latency" -v threshold="$ping_latency_warn" 'BEGIN {if (latency >= threshold) print "yes"; else print "no"}'`
+      #
+      # Only evaluate latency when at least one ping reply was received.
+      # Packet loss already handles the case where no replies were received.
+      #
+      if [ "$received" -gt 0 ]; then
+         if [ "$latency_critical" = "yes" ]; then
+            server_status=$CRITICAL
+         else
+            if [ "$latency_warning" = "yes" ] && [ "$server_status" -lt "$WARN" ]; then
+               server_status=$WARN
+            fi
+         fi
+      fi
+      #
+      # Append a human-readable result for this DNS server.
+      #
+      if [ -z "$ping_status_text" ]; then
+         ping_status_text="$server_status_text"
+      else
+         ping_status_text="$ping_status_text; $server_status_text"
+      fi
+      #
+      # Nagios return codes are OK=0, WARN=1, CRITICAL=2.  Keep the worst result.
+      #
+      if [ "$server_status" -gt "$ping_status" ]; then
+         ping_status=$server_status
       fi
    done
 }
+
 
 
 
@@ -465,45 +591,167 @@ check_ipaddr_all_zeros() {
 
 
 
+get_nameserver_ping_status() {
+   #
+   # Retrieve the number of ping replies previously received from the DNS server
+   # currently being checked.  This avoids Bash arrays and remains Bourne-shell portable.
+   #
+   nameserver_ping_received=0
+
+   if [ "$nameserver" = "$dns1_server" ]; then
+      nameserver_ping_received=$dns1_ping_received
+   fi
+   if [ "$nameserver" = "$dns2_server" ]; then
+      nameserver_ping_received=$dns2_ping_received
+   fi
+   if [ "$nameserver" = "$dns3_server" ]; then
+      nameserver_ping_received=$dns3_ping_received
+   fi
+}
+
+
+report_dns_transport_failure() {
+   #
+   # The requested A or PTR query did not receive a usable DNS response.
+   # Before declaring the DNS service unavailable, issue a separate SOA query
+   # for the configured DNS domain against the same name server.  
+   # This distinguishes a DNS server that is not answering any DNS queries from a 
+   # failure that is specific to the requested A or PTR query.
+   #
+   generic_dns_query="$domain_name SOA record"
+   generic_dns_output=""
+   generic_dns_return=1
+   generic_dns_responded=no
+
+   if [ -f "$dig" ] && [ -x "$dig" ]; then
+      generic_dns_output=`$dig +time=3 +tries=1 @$nameserver $domain_name SOA 2>&1`
+      generic_dns_return=$?
+   else
+      if [ -f "$drill" ] && [ -x "$drill" ]; then
+         generic_dns_output=`$drill @$nameserver $domain_name SOA 2>&1`
+         generic_dns_return=$?
+      fi
+   fi
+   #
+   echo $verbose | $grep -q yes && echo "   specific DNS query failed; testing general DNS service with $generic_dns_query"
+   echo $verbose | $grep -q yes && echo "$generic_dns_output"
+   #
+   #
+   # A zero return code without transport-error text means the DNS server answered.
+   # Also accept an explicit DNS response code as proof that the DNS daemon replied,
+   # even if the utility returned a non-zero status for that response.
+   #
+   if [ "$generic_dns_return" -eq 0 ]; then
+      generic_dns_responded=yes
+   fi
+   #
+   echo "$generic_dns_output" | $grep -q -i -E "status:[[:space:]]*[A-Z]+|rcode[[:space:]]+[A-Z]+" && generic_dns_responded=yes
+   echo "$generic_dns_output" | $grep -q -i -E "no servers could be reached|timed out|connection refused|communications error|network is unreachable" && generic_dns_responded=no
+   #
+   #
+   # The DNS service answered the generic SOA query.  The problem is therefore
+   # specific to the original A or PTR query rather than a complete DNS outage.
+   #
+   if [ "$generic_dns_responded" = "yes" ]; then
+      echo "$CHECK_NAME WARN - DNS server $nameserver is responding to DNS queries, but did not successfully respond to the specific $dns_query query.  The general $generic_dns_query query received a DNS response."
+      exit $WARN
+   fi
+   #
+   # Neither the requested query nor the generic DNS health query received a DNS
+   # response.  Use the earlier ping result to provide additional reachability context.
+   #
+   get_nameserver_ping_status
+
+   if [ "$nameserver_ping_received" -eq 0 ]; then
+      echo "$CHECK_NAME CRITICAL - DNS server $nameserver is not responding to ping or DNS queries.  Both the specific $dns_query query and the general $generic_dns_query query failed.  The DNS server may be down or unreachable."
+      exit $CRITICAL
+   fi
+
+   echo "$CHECK_NAME WARN - DNS server $nameserver responds to ping, but is not responding to DNS queries.  Both the specific $dns_query query and the general $generic_dns_query query failed.  Please confirm that a DNS resolver is running and listening on port 53."
+   exit $WARN
+}
+
+
+check_dns_response() {
+   #
+   # Check the saved output from dig or drill and differentiate a DNS service
+   # failure from a valid DNS response that indicates a lookup problem.
+   #
+   # The caller must set dns_output, dns_return, nameserver and dns_query.
+   #
+   if [ "$dns_return" -ne 0 ]; then
+      report_dns_transport_failure
+   fi
+   #
+   # Some implementations may return useful text even when the command return
+   # code does not clearly identify a transport failure.
+   #
+   echo "$dns_output" | $grep -q -i -E "no servers could be reached|timed out|connection refused|communications error|network is unreachable" && {
+      report_dns_transport_failure
+   }
+   #
+   # DNS response codes.  These prove that the DNS server responded, while
+   # identifying why the requested record could not be returned.
+   #
+   echo "$dns_output" | $grep -q -i -E "status:[[:space:]]*NXDOMAIN|rcode[[:space:]]+NXDOMAIN" && {
+      echo "$CHECK_NAME WARN - DNS server $nameserver responded to the query, but $dns_query does not exist in DNS (NXDOMAIN)."
+      exit $WARN
+   }
+   echo "$dns_output" | $grep -q -i -E "status:[[:space:]]*SERVFAIL|rcode[[:space:]]+SERVFAIL" && {
+      echo "$CHECK_NAME WARN - DNS server $nameserver responded to the query, but returned SERVFAIL for $dns_query."
+      exit $WARN
+   }
+   echo "$dns_output" | $grep -q -i -E "status:[[:space:]]*REFUSED|rcode[[:space:]]+REFUSED" && {
+      echo "$CHECK_NAME WARN - DNS server $nameserver responded to the query, but refused the DNS request for $dns_query."
+      exit $WARN
+   }
+}
+
+
+
 check_forward_resolution() {
    #
    # Confirm A record for the current hostname exists in DNS for forward resolution
    #
-   # This section confirms there is a valid A record for the current hostname in DNS
-   #
-   #
-   # perform dns lookup against each name server
-   #
-   # We already have a list of nameservers, so use a for loop to check each nameserver one at a time.
    for nameserver in $nameserver_list ; do
       host_name=`$hostname -s`
       #
-      # skip check if this is a DMZ host using assorted public name servers
-      # if the host is using a public DNS server, the local hostname will not be resolvable by the public DNS server
-      if [ "$nameserver" = "8.8.8.8"         ] ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "8.8.4.4"         ] ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "208.67.222.222"  ] ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.220"  ] ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.123"  ] ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.222.123"  ] ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "1.1.1.1"         ] ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "1.0.0.1"         ] ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "9.9.9.9"         ] ; then continue ; fi   #Quad9 public DNS
-      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
+      # Skip public DNS servers because local hostnames will normally not be resolvable by public DNS servers.
+      #
+      if [ "$nameserver" = "8.8.8.8"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "8.8.4.4"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "208.67.222.222"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.220"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.222.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "1.1.1.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "1.0.0.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "9.9.9.9"         ] ; then continue ; fi    #Quad9      public DNS
+      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi    #Quad9      public DNS
+      #
+      dns_query="$host_name.$domain_name A record"
+      if [ -f "$dig" ]; then
+         dns_output=`$dig +time=3 +tries=1 @$nameserver $host_name.$domain_name A 2>&1`
+         dns_return=$?
+      fi
+      if [ -f "$drill" ]; then
+         dns_output=`$drill @$nameserver $host_name.$domain_name A 2>&1`
+         dns_return=$?
+      fi
+      echo $verbose | $grep -q yes && echo "Checking name resolution for hostname $host_name.$domain_name A record against $nameserver DNS server"
+      echo $verbose | $grep -q yes && echo "$dns_output"
+      check_dns_response
+      #
+      # The DNS server responded successfully.  Confirm that an A record was returned.
       #
       dnscheck=fail
-      if [ -f "$dig"   ]; then command="$dig      @$nameserver    $host_name.$domain_name" ; fi   #command for AIX,Linux,OpenBSD
-      if [ -f "$drill" ]; then command="$drill    @$nameserver    $host_name.$domain_name" ; fi   #command for FreeBSD (uses drill instead of dig)
-      echo $verbose | $grep -q yes && echo Checking name resolution for hostname $host_name.$domain_name A record against $nameserver DNS server
-      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;'"
-      $command | $grep -v '^;' | $grep -q -i $host_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo "$dns_output" | $grep -v '^;' | $grep -q -i "$host_name" && dnscheck=succeed
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find an A record for $host_name in DNS.  Forward DNS lookups for $host_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add an A record for $host_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - DNS server $nameserver responded successfully, but did not return an A record for $host_name.$domain_name."
          exit $WARN
       fi
    done
 }
-
 
 
 
@@ -511,42 +759,43 @@ check_forward_resolution_localhost() {
    #
    # Confirm A record for localhost exists in DNS for forward resolution
    #
-   # This section confirms a valid A record exists for localhost in DNS
-   # Please note that unlike the previous section, we only search for "localhost" instead of "localhost.mydomain.com"
-   #
-   #
-   # perform dns lookup against each name server
-   #
-   # We already have a list of nameservers, so use a for loop for check each nameserver one at a time.
    for nameserver in $nameserver_list ; do
       localhost_name=localhost
       #
-      # skip check if this is a DMZ host using assorted public name servers
-      # if the host is using a public DNS server, the hostname localhost may or may not be resolvable by the public DNS server
-      if [ "$nameserver" = "8.8.8.8" ]         ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "8.8.4.4" ]         ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "208.67.222.222" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.220" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.123" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.222.123" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "1.1.1.1" ]         ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "1.0.0.1" ]         ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "9.9.9.9" ]         ; then continue ; fi   #Quad9 public DNS
-      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
+      # Skip public DNS servers because localhost may or may not be resolvable by public DNS servers.
+      #
+      if [ "$nameserver" = "8.8.8.8"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "8.8.4.4"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "208.67.222.222"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.220"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.222.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "1.1.1.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "1.0.0.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "9.9.9.9"         ] ; then continue ; fi    #Quad9      public DNS
+      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi    #Quad9      public DNS
+      #
+      dns_query="$localhost_name A record"
+      if [ -f "$dig" ]; then
+         dns_output=`$dig +time=3 +tries=1 @$nameserver $localhost_name A 2>&1`
+         dns_return=$?
+      fi
+      if [ -f "$drill" ]; then
+         dns_output=`$drill @$nameserver $localhost_name A 2>&1`
+         dns_return=$?
+      fi
+      echo $verbose | $grep -q yes && echo "Checking forward name resolution for hostname $localhost_name A record against $nameserver DNS server"
+      echo $verbose | $grep -q yes && echo "$dns_output"
+      check_dns_response
       #
       dnscheck=fail
-      if [ -f "$dig"   ]; then command="$dig      @$nameserver    $localhost_name A" ; fi   #command for AIX,Linux,OpenBSD
-      if [ -f "$drill" ]; then command="$drill    @$nameserver    $localhost_name A" ; fi   #command for FreeBSD (uses drill instead of dig)
-      echo $verbose | $grep -q yes && echo Checking forward name resolution for hostname $localhost_name A record against $nameserver DNS server
-      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;'"
-      $command | $grep -v '^;' | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo "$dns_output" | $grep -v '^;' | $grep -q -i "$localhost_name" && dnscheck=succeed
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find an A record for $localhost_name in DNS.  Forward DNS lookups for $localhost_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add an A record for $localhost_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - DNS server $nameserver responded successfully, but did not return an A record for $localhost_name."
          exit $WARN
       fi
    done
 }
-
 
 
 
@@ -554,83 +803,68 @@ check_reverse_resolution() {
    #
    # Confirm PTR record for the current hostname exists in DNS for reverse resolution
    #
-   # This confirms valid PTR records exist in DNS
-   #
-   #
-   # perform reverse dns lookup against each name server
-   #
-   # NOTE: the output of the "host" command is slightly different on AIX and Linux
-   # On Linux:
-   #  $ host myhost.example.com
-   #  myhost.example.com has address 192.168.14.19
-   # On AIX:
-   #  $ host myhost.example.com
-   #  myhost.example.com is 192.168.14.19
-   #
-   # We already have a list of nameservers, so use a for loop to run queries against each nameserver
    for nameserver in $nameserver_list ; do
       host_name=`$hostname -s`
-      # xxx host_ip=`$host $host_name.$domain_name | $sed -e "s/ is / /g" | $sed -e "s/ has address / /g" | $awk '{print $2}' | $sed -e "s/,//g"`
+      in_addr_arpa=`echo $host_ip | $awk -F . '{print $4 "." $3 "." $2 "." $1 ".in-addr.arpa"}'`
       #
-      # The dig utility will show the PTR record using in-addr.arpa format.
-      # For example, the IP address 1.2.3.4 will be displayed as 4.3.2.1.in-addr.arpa
-      in_addr_arpa=`echo $host_ip | awk -F . '{print $4 "." $3 "." $2 "." $1 ".in-addr.arpa"}'`
+      # Skip public DNS servers because local hostnames will normally not be resolvable by public DNS servers.
       #
+      if [ "$nameserver" = "8.8.8.8"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "8.8.4.4"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "208.67.222.222"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.220"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.222.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "1.1.1.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "1.0.0.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "9.9.9.9"         ] ; then continue ; fi    #Quad9      public DNS
+      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi    #Quad9      public DNS
       #
-      # Skip check if this is a DMZ host using assorted public name servers
-      # If the host is using a public DNS server, the local hostname will not be resolvable by the public DNS server
-      # The "continue" command skips to the next iteration of the for loop
-      if [ "$nameserver" = "8.8.8.8" ]         ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "8.8.4.4" ]         ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "208.67.222.222" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.220" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.123" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.222.123" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "1.1.1.1" ]         ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "1.0.0.1" ]         ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "9.9.9.9" ]         ; then continue ; fi   #Quad9 public DNS
-      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
+      dns_query="$host_ip PTR record"
+      if [ -f "$dig" ]; then
+         dns_output=`$dig +time=3 +tries=1 @$nameserver -x $host_ip 2>&1`
+         dns_return=$?
+      fi
+      if [ -f "$drill" ]; then
+         dns_output=`$drill -x @$nameserver $host_ip 2>&1`
+         dns_return=$?
+      fi
+      echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $host_ip or $in_addr_arpa PTR record against $nameserver name server"
+      echo $verbose | $grep -q yes && echo "$dns_output"
+      check_dns_response
       #
-      #
-      # This section will tell us if the PTR record exists, but will not tell us if the IP address described in the PTR record is bound to a local network interface.
-      # In other words, this section confirms the PTR record exists, but not that the PTR record points at the correct host.
+      # The DNS server responded successfully.  Confirm that the PTR record exists.
       #
       dnscheck=fail
-      if [ -f "$dig"   ]; then command="$dig      @$nameserver -x $host_ip" ; fi #command for AIX,Linux,OpenBSD
-      if [ -f "$drill" ]; then command="$drill -x @$nameserver    $host_ip" ; fi #command for FreeBSD (uses drill instead of dig)
-      echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $host_ip or $in_addr_arpa PTR record against $nameserver name server"
-      #echo $verbose | $grep -q yes && echo "   running command:  $cmmand | $grep -v '^;' | $grep $in_addr_arpa  "
-      $command | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo "$dns_output" | $grep -v '^;' | $grep -q -i "$in_addr_arpa" && dnscheck=succeed
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find a PTR record for $host_ip in DNS.  Reverse DNS lookups for $host_name.$domain_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for IP address $host_ip pointing at hostname $host_name.$domain_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - DNS server $nameserver responded successfully, but did not return a PTR record for $host_ip."
          exit $WARN
       fi
       #
-      # At this point, we know that the PTR record exists, so now we check to confirm that IP address is bound to a local network interface.
-      # This allows us to differentiate between a PTR record not existing and a PTR record that points at the wrong host.
+      # Confirm that the IP address described in the PTR record is bound to a local network interface.
       #
       echo $verbose | $grep -q yes && echo "Confirming $host_ip is bound to a local network interface"
-      if [ -f "$ip" ]; then		#modern Linux distros have replaced /usr/sbin/ifconfig with /usr/sbin/ip
+      if [ -f "$ip" ]; then
          dnscheck=fail
          echo $verbose | $grep -q yes && echo "   running command:  $ip addr show | $grep -i $host_ip "
          $ip addr show | $grep -q -i $host_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
          if [ "$dnscheck" = "fail" ]; then
-            echo "$CHECK_NAME WARN - PTR record for $host_ip is pointing at hostname $host_name, but the IP address $host_ip is not bound to any network interface on $host_name. Please fix up the A and PTR records for hostname $host_name on DNS server $nameserver, or add IP address $host_ip to a network interface on $host_name"
+            echo "$CHECK_NAME WARN - PTR record for $host_ip exists, but the IP address $host_ip is not bound to any network interface on $host_name. Please fix the A and PTR records for hostname $host_name on DNS server $nameserver, or add IP address $host_ip to a network interface on $host_name"
             exit $WARN
          fi
       fi
-      if [ -f "$ifconfig" ]; then	#legacy Linux distros and AIX are still using /usr/sbin/ifconfig instead of /usr/sbin/ip
+      if [ -f "$ifconfig" ]; then
          dnscheck=fail
          echo $verbose | $grep -q yes && echo "   running command:  $ifconfig -a | $grep -i $host_ip "
          $ifconfig -a | $grep -q $host_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
          if [ "$dnscheck" = "fail" ]; then
-            echo "$CHECK_NAME WARN - PTR record for $host_ip is pointing at hostname $host_name, but the IP address $host_ip is not bound to any network interface on $host_name. Please fix up the A and PTR records for hostname $host_name on DNS server $nameserver, or add IP address $host_ip to a network interface on $host_name"
+            echo "$CHECK_NAME WARN - PTR record for $host_ip exists, but the IP address $host_ip is not bound to any network interface on $host_name. Please fix the A and PTR records for hostname $host_name on DNS server $nameserver, or add IP address $host_ip to a network interface on $host_name"
             exit $WARN
          fi
       fi
    done
 }
-
 
 
 
@@ -639,93 +873,76 @@ check_reverse_resolution_127_0_0_1() {
    # Confirm PTR record for 127.0.0.1 exists in DNS for reverse resolution
    #
    echo $verbose | $grep -q yes && echo Confirm PTR record exists for 127.0.0.1
-   # This confirms valid PTR record for localhost exist in DNS
-   #
-   #
-   # perform reverse dns lookup against each name server
-   #
-   # NOTE: the output of the "host" command is slightly different on AIX and Linux
-   # On Linux:
-   #  $ host localhost
-   #  localhost has address 127.0.0.1
-   # On AIX:
-   #  $ host localhost
-   #  localhost is 127.0.0.1
-   #
-   # We already have a list of nameservers, so use a for loop to run queries against each nameserver
    for nameserver in $nameserver_list ; do
       localhost_name=localhost
       localhost_ip=127.0.0.1
+      in_addr_arpa=`echo $localhost_ip | $awk -F . '{print $4 "." $3 "." $2 "." $1 ".in-addr.arpa"}'`
       #
-      # The dig utility will show the PTR record using in-addr.arpa format.
-      # For example, the IP address 1.2.3.4 will be displayed as 4.3.2.1.in-addr.arpa
-      in_addr_arpa=`echo $localhost_ip | awk -F . '{print $4 "." $3 "." $2 "." $1 ".in-addr.arpa"}'`
+      # Skip public DNS servers because the 127.0.0.1 PTR record may or may not be resolvable by public DNS servers.
       #
+      if [ "$nameserver" = "8.8.8.8"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "8.8.4.4"         ] ; then continue ; fi    #Google     public DNS
+      if [ "$nameserver" = "208.67.222.222"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.220"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.220.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "208.67.222.123"  ] ; then continue ; fi    #OpenDNS    public DNS
+      if [ "$nameserver" = "1.1.1.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "1.0.0.1"         ] ; then continue ; fi    #Cloudflare public DNS
+      if [ "$nameserver" = "9.9.9.9"         ] ; then continue ; fi    #Quad9      public DNS
+      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi    #Quad9      public DNS
       #
-      # Skip check if this is a DMZ host using assorted public name servers
-      # If the host is using a public DNS server, the 127.0.0.1 IP address may or may not be resolvable by the public DNS server
-      # The "continue" command skips to the next iteration of the for loop
-      if [ "$nameserver" = "8.8.8.8" ]         ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "8.8.4.4" ]         ; then continue ; fi   #Google public DNS
-      if [ "$nameserver" = "208.67.222.222" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.220" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.220.123" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "208.67.222.123" ]  ; then continue ; fi   #OpenDNS
-      if [ "$nameserver" = "1.1.1.1" ]         ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "1.0.0.1" ]         ; then continue ; fi   #Cloudflare public DNS
-      if [ "$nameserver" = "9.9.9.9" ]         ; then continue ; fi   #Quad9 public DNS
-      if [ "$nameserver" = "149.112.112.112" ] ; then continue ; fi   #Quad9 public DNS
+      dns_query="$localhost_ip PTR record"
+      if [ -f "$dig" ]; then
+         dns_output=`$dig +time=3 +tries=1 @$nameserver -x $localhost_ip 2>&1`
+         dns_return=$?
+      fi
+      if [ -f "$drill" ]; then
+         dns_output=`$drill -x @$nameserver $localhost_ip 2>&1`
+         dns_return=$?
+      fi
+      echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $localhost_ip or $in_addr_arpa PTR record against $nameserver name server"
+      echo $verbose | $grep -q yes && echo "$dns_output"
+      check_dns_response
+      #
+      # Confirm that the PTR record exists.
       #
       dnscheck=fail
-      echo $verbose | $grep -q yes && echo "Checking reverse name resolution for IP address $localhost_ip or $in_addr_arpa PTR record against $nameserver name server"
-      #
-      # We want to differentiate the PTR not existing at all from the PTR existing but pointing at the wrong A record.
-      # This section only checks to see if the PTR record exists, but does not confirm it points to the correct A record.
-      #
-      if [ -f "$dig"   ]; then command="$dig      @$nameserver -x $localhost_ip" ; fi #command for AIX,Linux,OpenBSD
-      if [ -f "$drill" ]; then command="$drill -x @$nameserver    $localhost_ip" ; fi #command for FreeBSD (uses drill instead of dig)
-      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;' | $grep $in_addr_arpa  "
-      $command | $grep -v '^;' | $grep -q -i $in_addr_arpa && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      echo "$dns_output" | $grep -v '^;' | $grep -q -i "$in_addr_arpa" && dnscheck=succeed
       if [ "$dnscheck" = "fail" ]; then
-         echo "$CHECK_NAME WARN - Could not find a PTR record for $localhost_ip in DNS.  Reverse DNS lookups for $localhost_name are failing against the $nameserver DNS server.  Please ask the DNS administrator to add a PTR record for $localhost_name on the $nameserver DNS server."
+         echo "$CHECK_NAME WARN - DNS server $nameserver responded successfully, but did not return a PTR record for $localhost_ip."
          exit $WARN
       fi
       #
-      # We want to differentiate the PTR not existing at all from the PTR existing but pointing at the wrong A record.
-      # We have already confirmed the PTR record exists, so this section confirms the PTR record points at the correct A record.
+      # Confirm that the PTR record points at localhost.
       #
-      echo $verbose | $grep -q yes && echo "   running command:  $command | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -i $localhost_name  "
-      $command | $grep -v '^;' | $grep -i $in_addr_arpa | $grep -q -i $localhost_name && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+      dnscheck=fail
+      echo "$dns_output" | $grep -v '^;' | $grep -i "$in_addr_arpa" | $grep -q -i "$localhost_name" && dnscheck=succeed
       if [ "$dnscheck" = "fail" ]; then
          echo "$CHECK_NAME WARN - PTR record for $localhost_ip exists in DNS, but does not point at the correct hostname. Please ask the DNS administrator to update the $localhost_ip PTR record to point at $localhost_name"
          exit $WARN
       fi
       #
-      # At this point, we know that the PTR record exists, so now we check to confirm that IP address is bound to a local network interface.
-      # This allows us to differentiate between a PTR record not existing and a PTR record that points at the wrong host.
+      # Confirm that 127.0.0.1 is bound to a local network interface.
       #
       echo $verbose | $grep -q yes && echo "Confirming $localhost_ip is bound to a local network interface"
-      if [ -f "$ip" ]; then		#modern Linux distros have replaced /usr/sbin/ifconfig with /usr/sbin/ip
+      if [ -f "$ip" ]; then
          dnscheck=fail
-         echo $verbose | $grep -q yes && echo "   running command:  $ip addr show | $grep -i $localhost_ip "
-         $ip addr show | $grep -q -i $localhost_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+         $ip addr show | $grep -q -i $localhost_ip && dnscheck=succeed
          if [ "$dnscheck" = "fail" ]; then
-            echo "$CHECK_NAME WARN - PTR record for $localhost_ip is pointing at the wrong hostname. Please ask the DNS administrator to update the PTR record for IP address $localhost_ip to point at hostname $localhost_name on the $nameserver DNS server."
+            echo "$CHECK_NAME WARN - PTR record for $localhost_ip exists, but $localhost_ip is not bound to a local network interface."
             exit $WARN
          fi
       fi
-      if [ -f "$ifconfig" ]; then	#legacy Linux distros and AIX are still using /usr/sbin/ifconfig instead of /usr/sbin/ip
+      if [ -f "$ifconfig" ]; then
          dnscheck=fail
-         echo $verbose | $grep -q yes && echo "   running command:  $ifconfig -a | $grep -i $localhost_ip "
-         $ifconfig -a | $grep -q $localhost_ip && dnscheck=succeed && echo $verbose | $grep -q yes && echo "   command succeeded"
+         $ifconfig -a | $grep -q $localhost_ip && dnscheck=succeed
          if [ "$dnscheck" = "fail" ]; then
-            echo "$CHECK_NAME WARN - PTR record for $localhost_ip is pointing at the wrong hostname. Please ask the DNS administrator to update the PTR record for IP address $localhost_ip to point at hostname $localhost_name on the $nameserver DNS server."
+            echo "$CHECK_NAME WARN - PTR record for $localhost_ip exists, but $localhost_ip is not bound to a local network interface."
             exit $WARN
          fi
       fi
    done
 }
-
 
 
 
@@ -780,11 +997,21 @@ check_aix_ipv6_loopback() {
 
 print_output() {
    #
-   # If we get this far, everything is good
+   # If we get this far, all DNS resolution checks are good.  The ping checks may
+   # still have detected latency or packet-loss WARN/CRITICAL conditions.
    #
    host_name=`$hostname -s`
-   perf_data="nameserver_count=$nscount;;;;"
-   echo "$CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=$localhost_ip resolver=$resolver nameservers=$nameserver_list | $perf_data "
+   perf_data="nameserver_count=$nscount;;;;$ping_perf_data"
+   #
+   if [ "$ping_status" -eq "$CRITICAL" ]; then
+      echo "$CHECK_NAME CRITICAL hostname=$host_name.$domain_name $ping_status_text | $perf_data "
+      exit $CRITICAL
+   fi
+   if [ "$ping_status" -eq "$WARN" ]; then
+      echo "$CHECK_NAME WARN hostname=$host_name.$domain_name $ping_status_text | $perf_data "
+      exit $WARN
+   fi
+   echo "$CHECK_NAME OK hostname=$host_name.$domain_name ipaddr=$host_ip localhost=$localhost_ip resolver=$resolver nameservers=$nameserver_list $ping_status_text | $perf_data "
    exit $OK
 }
 
@@ -809,4 +1036,3 @@ check_reverse_resolution_127_0_0_1
 check_aix_netsvc
 check_aix_ipv6_loopback 
 print_output
-
