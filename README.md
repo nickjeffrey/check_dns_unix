@@ -11,7 +11,7 @@ nagios check to verify DNS configuration for UNIX-like operating systems.  The f
 
 
 # Requirements
-perl, ssh  on nagios server
+Written in bourne shell for maximum portability, so should run as-is on most UNIX-like operating systems.
 
 # Configuration
 
